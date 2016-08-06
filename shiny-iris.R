@@ -10,16 +10,14 @@ sc <- spark_connect(master = "local")
 #Read in Parquet Data
 spark_read_parquet(sc, "iris", "iris-parquet")
 iris_tbl <- tbl(sc, "iris")
-cols <- glimpse(iris_tbl) %>% 
-  colnames()
 
 ui <- pageWithSidebar(
   headerPanel('Iris k-means clustering'),
   sidebarPanel(
     
-    selectInput('xcol', 'X Variable', cols),
-    selectInput('ycol', 'Y Variable', cols,
-                selected = cols[2]),
+    selectInput('xcol', 'X Variable', tbl_vars(iris_tbl)),
+    selectInput('ycol', 'Y Variable', tbl_vars(iris_tbl),
+                selected = tbl_vars(iris_tbl)[2]),
     numericInput('clusters', 'Cluster count', 3,
                  min = 1, max = 9)
   ),
