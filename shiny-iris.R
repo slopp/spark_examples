@@ -8,7 +8,7 @@ library(shiny)
 sc <- spark_connect(master = "local")
 
 #Read in Parquet Data
-spark_read_parquet(sc, "iris", "shiny_iris_data")
+spark_read_parquet(sc, "iris", "iris-parquet")
 iris_tbl <- tbl(sc, "iris")
 cols <- glimpse(iris_tbl) %>% 
   colnames()
