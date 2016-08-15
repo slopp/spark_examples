@@ -1,0 +1,201 @@
+---
+title: "pyspark - sparklyr"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+  html_notebook: null
+---
+
+*** 
+
+#Overview
+
+As of Spark 2.0.0 you can save and load ML models. In Sparklyr this is done in one of two ways:
+
+1. Using the functions `ml_save()` and `ml_load()`. These functions are appropriate when you are **working in Sparklyr and want to save/restore for further work in Sparklyr**. The functions will automatically save and restore the entire `ml_model` object in R. However, not everything is serialized when the Spark object is serialized so not all of the information contained in the original model is available in a restored model. For instance, residuals() will not work)
+
+2. Using the primitives `invoke(..., "save")` and `invoke_static(..., "load")` on a Spark model object (the portion of an ml_model object stored in  `m$.model`). This approach is approriate for **cross-language save / load**. For example, you could fit and train a model in sparklyr (making use of tools like `ggplot2`) and then deploy the model to scala or pyspark. This article will demonstrate creating a model in sparklyr and reading it into pyspark and vice-versa.
+
+
+## Set up Sparklyr and Data
+
+The examples will be done in a local spark context using the iris data-set written to parquet (the data is accessible to pyspark and R). Spark 2.0.0 is used throughout.
+
+```{r echo = TRUE, warning = FALSE}
+library(sparklyr)
+library(dplyr)
+
+# Set some environment variables
+Sys.setenv(SPARK_HOME = spark_home_dir())
+sc <- spark_connect(master = "local")
+iris_tbl <- copy_to(sc, iris, "iris")
+```
+
+```{r eval = FALSE, echo = TRUE}
+#One-time write of iris-data to parquet
+spark_write_parquet(iris_tbl, "iris-parquet")
+```
+
+## Using R Notebook as an Orchestration Engine
+This entire example was constructed as a [R Notebook](rmarkdown.rstudio.com/r_notebooks.html). R Notebooks support [multiple language engines](http://rmarkdown.rstudio.com/authoring_knitr_engines.html) via knitr. While python is supported, pyspark is executed through the spark-submit utility. Though the python code is presented in the notebook, the code is evaluated by spark-submit in equivalent, stand-alone python files.  In the notebook this was done using bash code chunks.
+
+
+### spark-submit logging levels
+By default, submitting jobs to spark-submit prints out INFO level messages to the console. These messages can be helpful if you are running large jobs but is not as helpful in a demo. The log level was modified by changing $SPARK_HOME/conf/log4j.properties from:
+
+```
+# Set everything to be logged to the console
+log4j.rootCategory=INFO, console
+```
+to:
+
+```
+# Set everything to be logged to the console
+log4j.rootCategory=WARN, console
+```
+
+
+
+*** 
+
+#Saving / Restoring in Sparklyr
+
+To save and restore a model in Sparklyr use `ml_save` and `ml_load`.
+
+```{r echo = TRUE}
+m <- iris_tbl %>% 
+  ml_linear_regression(Species ~ Petal_Length)
+ml_save(m, "/home/sean/Other/spark_examples/tmp_model")
+```
+
+The `ml_save` function creates a directory that contains the Spark model object (saved in data, metadata, ...) and the relevant R metadata to re-construct the model (saved in metadata.rds):
+
+```{bash echo = TRUE}
+ls /home/sean/Other/spark_examples/tmp_model
+```
+
+The `ml_load` function glues back together the R metadata and the Spark model object:
+
+```{r echo = TRUE}
+same_model <- ml_load(sc, file = "/home/sean/Other/spark_examples/tmp_model")
+cbind(m, same_model)
+```
+
+
+***
+
+# Cross-Language Model Save / Load
+
+## From Python to R
+
+We will use the following python file (named create_pyspark_rf_model.py) to create a random forest classification model.
+
+```{python, echo=TRUE, eval=FALSE}
+from pyspark import SparkContext
+from pyspark.sql import *
+from pyspark.ml.classification import *
+from pyspark.ml.feature import *
+from pyspark.ml import Pipeline
+
+sc = SparkContext(appName="create_rf")
+sqlContext = SQLContext(sc)
+
+df = sqlContext.read.parquet("/home/sean/Other/spark_examples/iris-parquet")
+
+# first, translate Species from string to index
+stringIndexer = StringIndexer(inputCol="Species", outputCol="indexed").fit(df)
+td = stringIndexer.transform(df)
+
+# build a vector from our features
+featureIndexer =VectorAssembler(inputCols=["Petal_Length"], outputCol="features")
+tdd = featureIndexer.transform(td)
+
+#build classifier and fit (create model)
+dt = RandomForestClassifier(maxDepth=2, labelCol="indexed", featuresCol = "features")
+model = dt.fit(tdd)
+print(model)
+
+model.save("/home/sean/Other/spark_examples/pyspark_rf")
+
+# Test that we can load the model back into python
+same_model = RandomForestClassificationModel.load("/home/sean/Other/spark_examples/pyspark_rf")
+print(same_model)
+```
+
+Use spark-submit: 
+
+```{bash}
+cd /home/sean/.cache/spark/spark-2.0.0-bin-hadoop2.7
+./bin/spark-submit /home/sean/Other/spark_examples/create_pyspark_rf_model.py
+```
+
+
+The  created in python is read into R using `invoke_static`. The function requires the full class name for the model type and a file path. It is always safest to use the full file path, see `path.expand() ` for more details.
+
+```{r echo = TRUE}
+m <- invoke_static(sc,
+                   "org.apache.spark.ml.classification.RandomForestClassificationModel",
+                   "load",
+                   "/home/sean/Other/spark_examples/pyspark_rf")
+str(m)
+```
+
+The object returned is not a `ml_model` object. To use this object with commands like `predict` more work is necessary - see the `ml_model` constructor function.
+
+## R to Python
+
+Create the model in R and save it using the R `invoke` function and the scala method `save()`:
+
+```{r echo = TRUE}
+m <- ml_random_forest(iris_tbl, Species ~ Petal_Length)
+m$.model %>%
+  invoke("save","/home/sean/Other/spark_examples/sparklyr_rf")
+```
+
+
+We will use this python script to read in the model created in R:
+
+```{python, eval = FALSE, echo = TRUE}
+from pyspark import SparkContext
+from pyspark.sql import *
+from pyspark.ml.classification import *
+from pyspark.ml.feature import *
+from pyspark.ml import PipelineModel
+
+sc = SparkContext(appName="read_rf")
+sqlContext = SQLContext(sc)
+
+model = RandomForestClassificationModel.load("/home/sean/Other/spark_examples/sparklyr_rf")
+print(model)
+```
+
+This file is submitted to spark-submit:
+
+```{bash}
+cd ~/.cache/spark/spark-2.0.0-bin-hadoop2.7
+./bin/spark-submit /home/sean/Other/spark_examples/read_sparklyr_rf_model.py
+```
+
+The model in python can be used inside of a PipelineModel or used directly with `model.transform()`. However, when the model was created in R the data frame with features was transformed into a dataframe with only one feature column (a column where each row is a vector - see `ft_vector_assembler`). The name of this column is created by default. To use the model in python you have to make sure the input has the same column name, which you can get:
+
+```{r}
+m$model.parameters$features
+```
+
+For instance, we could extend the previous python script with:
+
+```{python, eval = FALSE, echo = TRUE}
+#Read in data to fit the StringIndexer
+df = sqlContext.read.parquet("/home/sean/Other/spark_examples/iris_parquet")
+
+# Create the necessary steps and Pipeline using the model from R
+stringIndexer = StringIndexer(inputCol="Species", outputCol="indexed").fit(df)
+featureIndexer =VectorAssembler(inputCols=["Petal_Length"], outputCol="features2f845d7bdebe")
+p = PipelineModel(stages = [stringIndexer, featureIndexer, model])
+
+# Evaluate the model
+pred = p.transform(df)
+print(pred)
+```
+
