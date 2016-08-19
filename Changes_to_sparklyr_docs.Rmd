@@ -1,0 +1,40 @@
+---
+title: "ML Doc Updates - Outline"
+author: "Sean Lopp"
+date: "8/17/2016"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+
+# Pipelines
+
+## Traditional Spark ML Pipelines
+Difference between fit and transform?
+
+Example with String Indexer
+
+The vector assembler
+
+Acknowledge more complicated pipelines ... later
+
+## The R ml_* Wrappers
+
+Targetted at R users. Take care of some portions of the traditional spark pipeline (just like R functions.) For example, one hot encoding.
+
+What is a sparklyr ml_model object vs spark model object?
+
+### Implications for Cross-Language Serialization
+
+It is hard! See the pyspark - sparklyr example
+
+## dplyr pipelines
+Allow you to combine Spark SQL, FT, and R ml_wrappers to achieve the equivalent of complicated Spark workflow in less code
+
+Think of a ml_* as being a mini-pipeline inside of a bigger pipeline?
+
+When are things evaluated?
+
+When to use sdf_register?

@@ -1,6 +1,10 @@
 ---
-title: "Classification Example"
-output: html_notebook
+title: "Comparison of Spark Classifiers Using Sparklyr"
+output: 
+  html_notebook: default
+  html_document:
+    toc: true
+    toc_float: true
 ---
 
 ```{r setup, include = FALSE}
@@ -11,16 +15,30 @@ library(dplyr)
 library(tidyr)
 library(titanic)
 library(ggplot2)
-source("ml_utils.R") # temporary (these functions should be in sparklyr soon)
+library(purrr)
 ```
 
-*** Overview 
+# Overview 
 
-We'll demonstrate how to fit a number of classification models in Spark on the kaggle Titanic dataset. A thorough background on the dataset and examples of analysis are available [here](https://www.kaggle.com/c/titanic)
+This [R Notebook](https://rmarkdown.rstudio.com/r_notebooks.html) will demonstrate how to fit and compare classification models in Spark using the R package [Sparklyr](http://spark.rstudio.com/).
 
+Models will include the Spark ML routines for logistic regression, decision trees, gradient boosted trees, random forest, and multi-layer perceptron (nueral net) and naive bayes.
 
+The article will cover:
 
-## Connect to Spark and Read Data
+* [Loading the Data]
+* [Feature Engineering](#fe1)
+* [Value Imputation]
+* [Model Building]
+* [Model Comparison]
+
+Jump to the [results!](#results)
+
+***
+
+# Loading the Data
+
+The analysis will use the popular Titanic kaggle dataset. A thorough background on the dataset and examples of analysis are available [here](https://www.kaggle.com/c/titanic).  The goal is to predict whether an individual survived or died based on factors including their class, gender, age, and family. The titanic data is readily available in R in the titanic package. The dataset is small (891 rows), but the methods presented are applicable to real Spark datasets.
 
 We'll work in a local Spark cluster and read the data in from parquet. The parquet files were generated through the following one-time process:
 
@@ -30,19 +48,21 @@ copy_to(sc, titanic_train, "titanic")
 tbl(sc, "titanic") %>% spark_write_parquet(path = "titanic-parquet")
 ```
 
-For now, it suffices to launch a local Spark instance and read the parquet files directly into Spark:
+Given parquet data, it suffices to launch Spark locally and read the parquet files in directly. The analysis is done in Spark 2.0, but most of the analysis can be replicated in earlier versions.
 
 ```{r}
-sc <- spark_connect(master = "local")
+sc <- spark_connect(master = "local", version = "2.0.0")
 spark_read_parquet(sc, name = "titanic", path = "titanic-parquet")
 titanic_tbl <- tbl(sc, "titanic")
-glimpse(titanic_tbl)
 ```
 
+***
 
-## Feature Engineering
+<a id=fe1></a>
 
-To start, create a number of new features based on the existing dataset. We'll use dplyr commands (against the Spark SQL API) and add the following variables:
+# Feature Engineering - dplyr
+
+While this dataset contains some helpful predictions, we'll demo how to create additional features in Sparklyr using dplyr commands.
 
 Variable | Definition
 ---------|-----------
@@ -51,7 +71,6 @@ Mother | A women with at least one child
 Father | A male with at least one son
 
 
-`compute` is used to force the execution of our dplyr chain, and `sdf_register` is used to save our table for later analysis.
 
 ```{r}
 titanic2_tbl <- titanic_tbl %>% 
@@ -62,32 +81,32 @@ titanic2_tbl <- titanic_tbl %>%
   sdf_register("titanic2")
 ```
 
-## Value Imputation
+> Sparklyr Tip: `compute` is used to force the execution of our dplyr chain, and `sdf_register` is used to save our table for later analysis.
 
-Many of the observations are missing age values:
+***
 
-```{r}
-titanic2_tbl %>% 
-  filter(is.na(Age)) %>% 
-  count()
-```
+# Value Imputation
 
-To address this problem, we'll impute the age value for the missing observations. We'll fit a linear regression to our complete observations and then used the scored values for imputation. For the linear regression we'll use some variables from the base data set and our added variables (except for remove Family_Size, which is a perfect linear combination of SibSp and Parch).
+This section is optional. There are many ways to account for missing values and different methods could impact relative model performance. In this case, we'll impute the missing age values using linear regression to generate a complete dataset. This dataset will be used to train and test all of the models.
+
+For imputation a linear model is fit on the complete observations and used to score missing values. `sdf_predict` is used to score the missing values. 
 
 ```{r}
 m <- titanic2_tbl %>% 
   na.omit() %>% 
   ml_linear_regression(Age ~ Pclass + Sex + SibSp + Parch + Fare + Father + Mother)
 summary(m)
-```
 
-We'll now score the age data using `sdf_predict`. 
-
-```{r}
 titanic3_tbl <- sdf_predict(m, titanic2_tbl) %>% 
   sdf_register("titanic3")
+```
 
-# Normally for large data we wouldn't be able to collect all of the residuals and would want to evaluate our model in a better way ... perhaps with kernel density estimation TODO - improve this problem
+> Sparklyr Tip: The `sdf_predict` function creates a new Spark Data Frame which we preserve and make accessible using `sdf_register`
+
+
+The imputated data can be evaluated by comparing the distribution age in the complete observations and the modeled observations.  
+
+```{r}
 titanic3_tbl %>% 
   mutate(error = Age - prediction) %>% 
   select(Age, prediction) %>% 
@@ -95,7 +114,11 @@ titanic3_tbl %>%
   collect() %>% 
   gather("Type", "Value") %>% 
   ggplot(aes(x = Value, fill = Type)) + geom_density()
+```
 
+The linear model used for imputation can also be evaluated by plotting the scored predictions against the true data for the complete observations.
+
+```{r}
 titanic3_tbl %>% 
   mutate(error = Age - prediction) %>% 
   select(error, Age) %>% 
@@ -103,22 +126,28 @@ titanic3_tbl %>%
   ggplot(aes(y = error, x = Age)) + geom_point() + geom_smooth() + ylab("Actual - Prediction")
 ```
 
-In a real analysis our linear model for age would need to be greatly improved before we could use the model to impute the age values. There is evidence of hetero-skedasticity and a bias to under-predict age.
+The results of these two evaluations aren't inspiring. There is evidence of hetero-skedasticity and a bias to under-predict age. However, for the sake of the demo we'll move forward with the imputed dataset.
 
-Ignoring these problems, we can impute the values. Additionally, we'll add a bucketized variable to represent the age bins: child, teen, adult, and retired (retired instead of elderly since only atitude separates the young from the old). To create the buckets a feature transformer is used in conjunction with `sdf_mutate`.
+***
+
+# Feature Engineering - ML Feature Transformers
+
+Now that age has been added, another feature will be created using one of the Spark ML feature transformers. Specifically, a bucketized variable to represent the age bins: child, teen, adult, and retired.
 
 
 ```{r}
 titanic_final_tbl <- titanic3_tbl %>% 
   mutate(Age = if_else(is.na(Age), prediction, Age)) %>% 
   mutate(Age = if_else(Age < 0, 0, Age)) %>% 
-  select(-prediction, -Sexmale, - Sexfemale) %>% 
+  select(-prediction, -Sex_male, - Sex_female) %>% 
   sdf_mutate(Age_Class = ft_bucketizer(input_col = Age,
                                        splits = c(0,12,18,65,Inf))) %>% 
   sdf_register("titanic_final")
 ```
 
-Now we can proceed to model the data with a number of alogorithms, but first we define a training and testing partition and a utility function.
+> Sparklry Tip: In a dplyr pipeline, feature transformers are used in conjunction with `sdf_mutate`
+
+The last step in preparing the data is to define a training and testing partition.
 
 ```{r}
 partition <- titanic_final_tbl %>% 
@@ -126,7 +155,128 @@ partition <- titanic_final_tbl %>%
 
 test <- partition$test
 train <- partition$train
+```
+> Sparklyr Tip: Use sdf_partition to create training and testing splits.
 
+***
+
+# Model Building
+
+The following section contains code used to construct the different ml models. One of the great features of Sparklyr is that each algorithm accepts R formulas making it easy to create and compare models.
+
+## Logistic Regression
+
+```{r}
+logistic <- train %>% 
+  ml_logistic_regression(Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age )
+
+logistic
+```
+
+## Decision Tree
+
+```{r}
+decision <- train %>% 
+  ml_decision_tree(Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age)
+
+summary(decision)
+```
+
+
+## Random Forest
+
+```{r}
+rf <- train %>% 
+  ml_random_forest(Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age )
+
+summary(rf)
+```
+
+
+## Gradient Boosted Tree
+
+```{r}
+gbt <- train %>% 
+  ml_gradient_boosted_trees(Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age )
+
+summary(gbt)
+```
+
+
+## Naive Bayes
+
+```{r}
+nb <- train %>% 
+  ml_naive_bayes(Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age )
+
+summary(nb)
+```
+
+
+## Nueral Network
+
+```{r}
+nn <- train %>% 
+  ml_multilayer_perceptron(Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age, layers = c(9,15,2))
+
+summary(nn)
+```
+
+
+## Training Time
+
+Even with a samll dataset the time to train an ml algorithm is important. The following code trains each model `n` times and plots the results. (Training the multi-layer perceptron model took noticeably longer and was not included)
+
+```{r warning = FALSE}
+formula <- "Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age"
+
+models <- c("ml_logistic_regression", "ml_decision_tree", 
+            "ml_random_forest", "ml_gradient_boosted_trees",
+            "ml_naive_bayes")
+
+model_call <- map2_chr("system.time(train %>% " , models, paste, sep = "") %>% 
+  map2_chr("(", paste, sep = "") %>% 
+  map2_chr(formula, paste, sep = "") %>% 
+  map2_chr("))", paste, sep = "")
+
+n <- 10
+calls <- rep(model_call, n)
+f <- vector(length = length(model_call)*n )
+for (i in 1:length(calls)) {
+  f[i] <- parse(text = calls[i])
+}
+
+res  <- map(f, eval)
+
+result <- data.frame(model = rep(models, n),
+                     time = sapply(res, function(x){as.numeric(x["elapsed"])})) 
+
+result %>% ggplot(aes(time,model)) + 
+  geom_boxplot() + 
+  geom_jitter(width = 0.4, aes(colour = model)) +
+  scale_colour_discrete(guide = FALSE)
+```
+
+
+***
+
+<a id="results"></a>
+
+# Model Comparison 
+
+This section compares the models:
+
+* [Training] Confusion Matrix
+* [Feature Importance]
+* [Lift Chart]
+* [Area Under ROC]
+* [Accuracy]
+
+## Training
+
+To begin, it is possible to evaluate how well the models work on the training data. For this comparison a confusion matrix is constructed for each model. To create the confusion matrix it is necessary to take the scored probabilites and map them to predictions. 0.5 is used as a cutoff.
+
+```{r}
 plot_confusion_matrix <- function(prediction_tbl_spark, title) {
   #prediction column should be a binary label
   prediction_tbl_spark %>% 
@@ -144,218 +294,79 @@ plot_confusion_matrix <- function(prediction_tbl_spark, title) {
         title = title)
 }
 
-ml_auc_roc <- function(predicted_tbl_spark, label, score){
-  df <- spark_dataframe(predicted_tbl_spark) 
-  sc <- spark_connection(df)
-  
-  envir <- new.env(parent = emptyenv())
-  
-  tdf <- df %>% ml_prepare_dataframe(response = label, feature = c(score, score), envir = envir)
-  
-  auc_roc <- invoke_new(sc, "org.apache.spark.ml.evaluation.BinaryClassificationEvaluator") %>% 
-    invoke("setLabelCol", envir$response) %>% 
-    invoke("setRawPredictionCol", envir$features) %>% 
-    invoke("setMetricName", "areaUnderROC") %>% 
-    invoke("evaluate", tdf)
-  
-  return(auc_roc)
-}
 
-ml_accuracy <- function(predicted_tbl_spark, label, predicted_lbl){
-  df <- spark_dataframe(predicted_tbl_spark) 
-  sc <- spark_connection(df)
-  
-  accuracy <- invoke_new(sc, "org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator") %>% 
-    invoke("setLabelCol", label) %>% 
-    invoke("setPredictionCol", predicted_lbl) %>% 
-    invoke("setMetricName", "accuracy") %>% 
-    invoke("evaluate", df)
-  
-  return(accuracy)
-}
-
-
-ml_tree_feature_importance <- function(model){
-  supported <- c("ml_model_gradient_boosted_trees",
-                 "ml_model_decision_tree",
-                 "ml_model_random_forest")
-  
-  if ( !(class(model)[1] %in% supported)) {
-    stop("Supported models include: ", paste(supported, collapse = ", "))
-  }
-  
-  if (class(model) != "ml_model_decision_tree") spark_require_version(sc, "2.0.0")
-  
-  importance <- invoke(model$.model,"featureImportances") %>% 
-    invoke("toArray") %>% 
-    cbind(model$features) %>% 
-    as.data.frame() 
-  
-  colnames(importance) <- c("importance", "feature")
-  
-  importance %>% arrange(desc(importance))
-}
-
-```
-
-One of the nicest features of Sparklyr is that each algorithm has a consistent argument definition, making it easy to create and compare models.
-
-## Logistic Regression
-
-```{r}
-logistic <- train %>% 
-  ml_logistic_regression(Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age )
-
-summary(logistic)
-
-# Confusion Matrix 
 sdf_predict(logistic, train) %>% 
-  plot_confusion_matrix("Logistic Regression Confusion Matrix on Training")
+  plot_confusion_matrix("Logistic Regression")
+
+sdf_predict(decision, train) %>% 
+  mutate(prediction = as.numeric(if_else(prediction > 0.5, 1, 0))) %>% 
+  plot_confusion_matrix("Decision Tree")
+
+sdf_predict(rf, train) %>% 
+  mutate(prediction = as.numeric(if_else(prediction > 0.5, 1, 0))) %>% 
+  plot_confusion_matrix("Random Forest")
+
+sdf_predict(gbt, train) %>% 
+  mutate(prediction = as.numeric(if_else(prediction > 0.5, 1, 0))) %>% 
+  plot_confusion_matrix("Gradient Boosted Tree")
 
 
+sdf_predict(nb, train) %>% 
+  mutate(prediction = as.numeric(if_else(prediction > 0.5, 1, 0))) %>%  
+  plot_confusion_matrix("Naive Bayes")
+
+sdf_predict(nn, train) %>% 
+  mutate(prediction = as.numeric(if_else(prediction > 0.5, 1, 0))) %>% 
+  plot_confusion_matrix("Nueral Net")
 ```
 
-## Decision Tree
+All of the models tend to over predict death. This is likely because the training data is not balanced, there were a lot more people who died on the titanic than survived.
 
-```{r}
-decision <- train %>% 
-  ml_decision_tree(Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age)
+## Feature Importance
 
-decision
+It is also interesting to compare the features that were identified by each model as being important predictors for survival. The logistic regression and tree models in Spark 2.0.0 implement feature importance metrics. The relative importance of each feature is compared below by model.
 
-# Confusion Matrix 
-sdf_predict(decision, train) %>% 
-  mutate(prediction = if_else(prediction > 0.5, 1, 0)) %>% 
- plot_confusion_matrix("Decision Tree Confusion Matrix on Training")
-
-# Metrics 
-sdf_predict(decision, train) %>% 
-    select(prediction, Survived) %>% 
-    ml_auc_roc(label = "Survived", score = "prediction")
-
-sdf_predict(decision, train) %>% 
-    select(prediction, Survived) %>% 
-    mutate(prediction_lbl = ifelse(prediction > 0.5, 1.0, 0.0)) %>% 
-    mutate(prediction_lbl = as.double(prediction_lbl)) %>% 
-    ml_accuracy(label = "Survived", predicted_lbl = "prediction_lbl")
-
+```{r warning = FALSE}
+l.res <- coefficients(logistic)
+l.res <- data.frame(feature = names(l.res),
+                    importance = as.numeric(l.res),
+                    model = "logistic regresison",
+                    stringsAsFactors = FALSE)
+l.res <- l.res %>% 
+  mutate(importance = abs(importance)) %>% 
+  filter(feature != '(Intercept)') %>% 
+  mutate(importance = percent_rank(importance)/n()*2)
+  
+clean_up <- function(x, model){
+  x %>% 
+    mutate(importance = as.numeric(levels(importance))) %>% 
+    mutate(feature = as.character(levels(feature))) %>% 
+    mutate(model = model)
+}
 
 #Features
-ml_tree_feature_importance(decision)
+d.res <- sparklyr:::ml_tree_feature_importance(sc, decision) %>% clean_up("decision tree")
+rf.res <- sparklyr:::ml_tree_feature_importance(sc, rf) %>% clean_up("random forest")
+gbt.res <- sparklyr:::ml_tree_feature_importance(sc, gbt) %>% clean_up("gradient boosted trees")
 
+
+
+l.res %>% 
+  full_join(d.res) %>% 
+  full_join(rf.res) %>% 
+  full_join(gbt.res) %>% 
+  ggplot(aes(x = model, y = feature, colour = importance, size = importance)) +
+  geom_point() + scale_size(guide = FALSE)
 ```
 
-
-## Random Forest
-
-```{r}
-rf <- train %>% 
-  ml_random_forest(Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age )
-
-rf
-
-# Confusion Matrix 
-sdf_predict(rf, train) %>% 
-  mutate(prediction = if_else(prediction > 0.5, 1, 0)) %>% 
-  plot_confusion_matrix("Random Forest Confusion Matrix on Training")
-
-# Metrics 
-sdf_predict(rf, train) %>% 
-    select(prediction, Survived) %>% 
-    ml_auc_roc(label = "Survived", score = "prediction")
-
-sdf_predict(rf, train) %>% 
-    select(prediction, Survived) %>% 
-    mutate(prediction_lbl = ifelse(prediction > 0.5, 1.0, 0.0)) %>% 
-    mutate(prediction_lbl = as.double(prediction_lbl)) %>% 
-    ml_accuracy(label = "Survived", predicted_lbl = "prediction_lbl")
+The number of siblings aboard and gender appear to be the most influential.
 
 
-```
+Arguably the most important comparison is how the models perform outside of the training data. Three metrics are used to compare model performance on the testing dataset: lift, Area Under the ROC curve, and accuracy.
 
+## Lift Chart
 
-## Gradient Boosted Tree
-
-```{r}
-gbt <- train %>% 
-  ml_gradient_boosted_trees(Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age )
-
-gbt
-
-# Confusion Matrix 
-sdf_predict(gbt, train) %>% 
-  mutate(prediction = if_else(prediction > 0.5, 1, 0)) %>% 
-  plot_confusion_matrix("Gradient Boosted Tree Confusion Matrix on Training")
-
-# Metrics 
-sdf_predict(gbt, train) %>% 
-    select(prediction, Survived) %>% 
-    ml_auc_roc(label = "Survived", score = "prediction")
-
-sdf_predict(gbt, train) %>% 
-    select(prediction, Survived) %>% 
-    mutate(prediction_lbl = ifelse(prediction > 0.5, 1.0, 0.0)) %>% 
-    mutate(prediction_lbl = as.double(prediction_lbl)) %>% 
-    ml_accuracy(label = "Survived", predicted_lbl = "prediction_lbl")
-
-```
-
-
-## Naive Bayes
-
-```{r}
-nb <- train %>% 
-  ml_naive_bayes(Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age )
-
-nb
-
-# Confusion Matrix 
-sdf_predict(nb, train) %>% 
-  mutate(prediction = if_else(prediction > 0.5, 1, 0)) %>% 
-  plot_confusion_matrix("Naive Bayes Confusion Matrix on Training")
-
-# Metrics 
-sdf_predict(nb, train) %>% 
-    select(prediction, Survived) %>% 
-    ml_auc_roc(label = "Survived", score = "prediction")
-
-sdf_predict(nb, train) %>% 
-    select(prediction, Survived) %>% 
-    mutate(prediction_lbl = ifelse(prediction > 0.5, 1.0, 0.0)) %>% 
-    mutate(prediction_lbl = as.double(prediction_lbl)) %>% 
-    ml_accuracy(label = "Survived", predicted_lbl = "prediction_lbl")
-```
-
-
-## Nueral Network
-
-```{r}
-nn <- train %>% 
-  ml_multilayer_perceptron(Survived ~ Pclass + Sex + SibSp + Parch + Family_Size + Father + Mother + Age_Class + Age, layers = c(9,15,2))
-
-nn
-
-# Confusion Matrix 
-sdf_predict(nn, train) %>% 
-  mutate(prediction = if_else(prediction > 0.5, 1, 0)) %>% 
-  plot_confusion_matrix("Nueral Net Confusion Matrix on Training")
-
-# Metrics 
-sdf_predict(nn, train) %>% 
-    select(prediction, Survived) %>% 
-    ml_auc_roc(label = "Survived", score = "prediction")
-
-sdf_predict(nn, train) %>% 
-    select(prediction, Survived) %>% 
-    mutate(prediction_lbl = ifelse(prediction > 0.5, 1.0, 0.0)) %>% 
-    mutate(prediction_lbl = as.double(prediction_lbl)) %>% 
-    ml_accuracy(label = "Survived", predicted_lbl = "prediction_lbl")
-```
-
-
-## Model Comparison 
-
-We can compute the lift chart (cummulative gains) for each of the models to compare performance for predicting both survival and death. Note that we do all of this computation in Spark! The key is that dplyr and sparklyr both support windows functions, including `ntiles` and `cumsum`.
+A cummulative gains lift chart compares model performance across different portions of the data for a single cutoff value (0.5). This is different from an ROC curve which contains information about model performance for many cutoff values. ROC is harder compute and is not implemented yet for ML algorithms. In a lift chart models that approach the upper left corner perform the best. 
 
 ```{r}
 
@@ -368,11 +379,6 @@ survived <- (test %>%
   count() %>% 
   as.data.frame())$n
 
-died <- (test %>% 
-  filter(Survived == 0) %>% 
-  count() %>% 
-  as.data.frame())$n
-
 # Predicting Survival
 gains_survived <- function(prediction){
   prediction %>% 
@@ -381,7 +387,7 @@ gains_survived <- function(prediction){
     mutate(bin = ntile(desc(prediction), 10)) %>% 
     group_by(bin) %>% 
     summarize(count = sum(Survived)) %>% 
-    mutate(prop = count / survived) %>% 
+    mutate(prop = as.numeric(count / survived)) %>% 
     arrange(bin) %>% 
     mutate(prop = cumsum(prop)) %>% 
     select(-count) %>% 
@@ -399,44 +405,97 @@ for (i in 1:length(models) ) {
   gains <- rbind(gains, g)
 } 
 
-ggplot(data = gains, aes(x = bin, y = prop, colour = model)) +
+ggplot(gains, aes(x = bin, y = prop, colour = model)) +
   geom_point() + geom_line() +
   ggtitle("Lift Chart for Predicting Survival - Test Data Set") + 
   xlab("") + ylab("")
+```
 
-# Predicting Deaths
-gains_died <- function(prediction){
-  prediction %>% 
-    select(Survived, prediction) %>% 
-    mutate(Survived = if_else(Survived==1, 0,1)) %>% 
-    mutate(prediction = 1 - prediction) %>% 
-    arrange(desc(prediction)) %>% 
-    mutate(bin = ntile(desc(prediction), 10)) %>% 
-    group_by(bin) %>%
-    summarize(count = sum(Survived)) %>% 
-    mutate(prop = count/died) %>% 
-    arrange(bin) %>% 
-    mutate(prop = cumsum(prop)) %>% 
-    select(-count) %>% 
-    collect() %>% 
-    as.data.frame()
-}  
+> Sparklyr Tip: dplyr and sparklyr both support windows functions, including `ntiles` and `cumsum`.
 
-gains <- data.frame(bin = 1:10, 
-                    prop = seq(0.1, 1, by = 0.1), 
-                    model = rep("base",10))
+The lift charts suggests that any of the tree models (random forest, gradient boosted trees, or the decision tree) will provide the best prediction.
 
-for (i in 1:length(models) ) {
-  g <- sdf_predict(models[[i]], test) %>% gains_died()
-  g <- g %>% mutate(model = model_names[i])
-  gains <- rbind(gains, g)
-} 
+## Area under ROC
 
-ggplot(data = gains, aes(x = bin, y = prop, colour = model)) +
-  geom_point() + geom_line() +
-  ggtitle("Lift Chart for Predicting Death - Test Data Set") + 
-  xlab("") + ylab("")
+Though ROC curves are not available, Spark ML does have support for Area Under the ROC curve. This metric captures performance across cut-off values, the higher the AUC the better
+
+```{r}
+rf.auc <- sdf_predict(rf, test) %>% 
+    select(prediction, Survived) %>% 
+    sparklyr:::ml_binary_classification_eval(metric = "areaUnderROC",label = "Survived", score = "prediction")
+
+
+gbt.auc <- sdf_predict(gbt, test) %>% 
+    select(prediction, Survived) %>% 
+    sparklyr:::ml_binary_classification_eval(metric = "areaUnderROC",label = "Survived", score = "prediction")
+
+
+nn.auc <- sdf_predict(nn, test) %>% 
+    select(prediction, Survived) %>% 
+    sparklyr:::ml_binary_classification_eval(metric = "areaUnderROC",label = "Survived", score = "prediction")
+
+
+nb.auc <- sdf_predict(nb, test) %>% 
+    select(prediction, Survived) %>% 
+    sparklyr:::ml_binary_classification_eval(metric = "areaUnderROC",label = "Survived", score = "prediction")
+
+
+d.auc <- sdf_predict(decision, test) %>% 
+    select(prediction, Survived) %>% 
+    sparklyr:::ml_binary_classification_eval(metric = "areaUnderROC",label = "Survived", score = "prediction")
+
+auc_cmp <- 
+  data.frame(models = c("decision tree", "random forest",
+                        "gradient boosted trees", "naive bayes", 
+                        "nueral net"), 
+             auc = c(d.auc, rf.auc, gbt.auc, nb.auc, nn.auc))
+
+ggplot(auc_cmp, aes(models, auc)) +
+  geom_bar(stat = "identity") +
+  ggtitle("Model Area Under ROC")
+
 
 ```
 
-The lift charts suggests that any of the tree models (random forest, gradient boosted trees, or the decision tree) will provide the best prediction.
+## Accuracy 
+
+```{r}
+rf.a <- sdf_predict(rf, test) %>% 
+    select(prediction, Survived) %>% 
+    mutate(prediction_lbl = ifelse(prediction > 0.5, 1.0, 0.0)) %>% 
+    mutate(prediction_lbl = as.double(prediction_lbl)) %>% 
+    sparklyr:::ml_classification_eval(metric = "accuracy",label = "Survived", predicted_lbl = "prediction_lbl")
+
+nb.a <- sdf_predict(nb, test) %>% 
+    select(prediction, Survived) %>% 
+    mutate(prediction_lbl = ifelse(prediction > 0.5, 1.0, 0.0)) %>% 
+    mutate(prediction_lbl = as.double(prediction_lbl)) %>% 
+    sparklyr:::ml_classification_eval(metric = "accuracy",label = "Survived", predicted_lbl = "prediction_lbl")
+
+nn.a <- sdf_predict(nn, test) %>% 
+    select(prediction, Survived) %>% 
+    mutate(prediction_lbl = ifelse(prediction > 0.5, 1.0, 0.0)) %>% 
+    mutate(prediction_lbl = as.double(prediction_lbl)) %>% 
+    sparklyr:::ml_classification_eval(metric = "accuracy",label = "Survived", predicted_lbl = "prediction_lbl")
+
+gbt.a <- sdf_predict(gbt, test) %>% 
+    select(prediction, Survived) %>% 
+    mutate(prediction_lbl = ifelse(prediction > 0.5, 1.0, 0.0)) %>% 
+    mutate(prediction_lbl = as.double(prediction_lbl)) %>% 
+    sparklyr:::ml_classification_eval(metric = "accuracy",label = "Survived", predicted_lbl = "prediction_lbl")
+
+decision.a <- sdf_predict(decision, test) %>% 
+    select(prediction, Survived) %>% 
+    mutate(prediction_lbl = ifelse(prediction > 0.5, 1.0, 0.0)) %>% 
+    mutate(prediction_lbl = as.double(prediction_lbl)) %>% 
+    sparklyr:::ml_classification_eval(metric = "accuracy",label = "Survived", predicted_lbl = "prediction_lbl")
+
+accuracy_cmp <- 
+  data.frame(models = c("decision tree", "random forest",
+                        "gradient boosted trees", "naive bayes", 
+                        "nueral net"), 
+             accuracy = c(decision.a, rf.a, gbt.a, nb.a, nn.a))
+
+ggplot(accuracy_cmp, aes(models, accuracy)) + geom_bar(stat = "identity") + ggtitle("Model Accuracy")
+```
+
