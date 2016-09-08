@@ -1,15 +1,9 @@
 library(sparklyr)
 library(dplyr)
 library(shiny)
+library(tibble)
 
-
-#Connect to Spark
-Sys.setenv(SPARK_HOME = "/usr/local/spark/spark-2.0.0-bin-hadoop2.7")
-sc <- spark_connect(master = "local")
-
-#Read in Parquet Data
-spark_read_parquet(sc, "iris", "iris-parquet")
-iris_tbl <- tbl(sc, "iris")
+iris_tbl <- as_tibble(iris)
 
 ui <- pageWithSidebar(
   headerPanel('Iris k-means clustering'),
@@ -28,27 +22,24 @@ ui <- pageWithSidebar(
 
 server <- function(input, output, session) {
   
-  # Nothing is evaluated in Spark at this step
+  
   selectedData <- reactive({
     iris_tbl %>% select_(input$xcol, input$ycol)
   })
   
-  # The Spark data frame is constructed and kmeans is run
+  
   clusters <- reactive({
     selectedData() %>%
-      ml_kmeans(centers = input$clusters)
+      kmeans(centers = input$clusters)
   })
   
   output$plot1 <- renderPlot({
     par(mar = c(5.1, 4.1, 0, 1))
     
-    #score the results in Spark, pull in results to R
-    scored <- predict(clusters(), iris_tbl) + 1
-    
+   
     #collect brings the data into R
     selectedData() %>% 
-      collect() %>% 
-      plot(col = scored,
+      plot(col = clusters()$cluster,
            pch = 20, cex = 4)
     
     points(clusters()$centers,
