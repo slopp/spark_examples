@@ -4,7 +4,7 @@ library(shiny)
 
 
 #Connect to Spark
-# Sys.setenv(SPARK_HOME = "...") TODO
+Sys.setenv(SPARK_HOME = "/usr/local/spark/spark-2.0.0-bin-hadoop2.7")
 sc <- spark_connect(master = "local")
 
 #Read in Parquet Data

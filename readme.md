@@ -1,0 +1,1 @@
+The Shiny Iris K-means Clustering App re-written to use a Spark backend and ml_kmeans. See this [Github diff]() to compare the original and Spark code side-by-side. This [video]() demos how Shiny on Spark can scale to 100s of GBs of data.
